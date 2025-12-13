@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright 2023 The AMReX Community
+# License: BSD-3-Clause-LBNL
+
+import amrex.space3d as amr
+import matplotlib.pyplot as plt  # Added for visualization
+
+def load_cupy():
+    if amr.Config.have_gpu:
+        try:
+            import cupy as cp
+            xp = cp
+            amr.Print("Note: found and will use cupy")
+        except ImportError:
+            amr.Print("Warning: GPU found but cupy not available! Trying managed memory in numpy...")
+            import numpy as np
+            xp = np
+        if amr.Config.gpu_backend == "SYCL":
+            amr.Print("Warning: SYCL GPU backend not yet implemented for Python")
+            import numpy as np
+            xp = np
+    else:
+        import numpy as np
+        xp = np
+        amr.Print("Note: found and will use numpy")
+    return xp
+
+
+def main(n_cell, max_grid_size, nsteps, plot_int, dt):
+    """
+    The main function, automatically called below if called as a script.
+    """
+    # CPU/GPU logic
+    xp = load_cupy()
+
+    # AMREX_D_DECL means "do the first X of these, where X is the dimensionality of the simulation"
+    dom_lo = amr.IntVect(*amr.d_decl(       0,        0,        0))
+    dom_hi = amr.IntVect(*amr.d_decl(n_cell-1, n_cell-1, n_cell-1))
+
+    # Make a single box that is the entire domain
+    domain = amr.Box(dom_lo, dom_hi)
+
+    # Make BoxArray and Geometry
+    ba = amr.BoxArray(domain)
+    ba.max_size(max_grid_size)
+
+    # This defines the physical box, [0,1] in each direction.
+    real_box = amr.RealBox([*amr.d_decl( 0., 0., 0.)], [*amr.d_decl( 1., 1., 1.)])
+
+    # This defines a Geometry object
+    coord = 0 # Cartesian
+    is_per = [*amr.d_decl(1,1,1)] # periodicity
+    geom = amr.Geometry(domain, real_box, coord, is_per)
+
+    # Extract dx from the geometry object
+    dx = geom.data().CellSize()
+
+    # Nghost = number of ghost cells for each array
+    Nghost = 1
+    # Ncomp = number of components for each array
+    Ncomp = 1
+
+    # How Boxes are distributed among MPI processes
+    dm = amr.DistributionMapping(ba)
+
+    # Allocate two phi multifabs
+    phi_old = amr.MultiFab(ba, dm, Ncomp, Nghost)
+    phi_new = amr.MultiFab(ba, dm, Ncomp, Nghost)
+    phi_old.set_val(0.)
+    phi_new.set_val(0.)
+
+    # time = starting time in the simulation
+    time = 0.
+
+    # Ghost cells
+    ng = phi_old.n_grow_vect
+    ngx = ng[0]
+    ngy = ng[1]
+    ngz = ng[2]
+
+    # Initialize data: phi = 1 + e^(-(r-0.5)^2)
+    for mfi in phi_old:
+        bx = mfi.validbox()
+        # phiOld is indexed in reversed order (z,y,x) and indices are local
+        phiOld = xp.array(phi_old.array(mfi), copy=False)
+        
+        x = (xp.arange(bx.small_end[0],bx.big_end[0]+1,1) + 0.5) * dx[0]
+        y = (xp.arange(bx.small_end[1],bx.big_end[1]+1,1) + 0.5) * dx[1]
+        z = (xp.arange(bx.small_end[2],bx.big_end[2]+1,1) + 0.5) * dx[2]
+        
+        rsquared = ((z[:         , xp.newaxis, xp.newaxis] - 0.5)**2
+                  + (y[xp.newaxis, :         , xp.newaxis] - 0.5)**2
+                  + (x[xp.newaxis, xp.newaxis, :         ] - 0.5)**2) / 0.01
+        
+        phiOld[:, ngz:-ngz, ngy:-ngy, ngx:-ngx] = 1. + xp.exp(-rsquared)
+
+    # Write a plotfile of the initial data if plot_int > 0
+    if plot_int > 0:
+        step = 0
+        pltfile = amr.concatenate("plt", step, 5)
+        varnames = amr.Vector_string(['phi'])
+        amr.write_single_level_plotfile(pltfile, phi_old, varnames, geom, time, 0)
+
+    # -------------------------------------------------------------------------
+    # Time Stepping Loop
+    # -------------------------------------------------------------------------
+    import numpy as np # Ensure numpy is available for plotting logic
+
+    for step in range(1, nsteps+1):
+        # Fill periodic ghost cells
+        phi_old.fill_boundary(geom.periodicity())
+
+        # new_phi = old_phi + dt * Laplacian(old_phi)
+        for mfi in phi_old:
+            phiOld = xp.array(phi_old.array(mfi), copy=False)
+            phiNew = xp.array(phi_new.array(mfi), copy=False)
+            hix = phiOld.shape[3]
+            hiy = phiOld.shape[2]
+            hiz = phiOld.shape[1]
+            
+            # Advance the data by dt
+            # Stencil: 7-point Laplacian
+            phiNew[:, ngz:-ngz,ngy:-ngy,ngx:-ngx] = (
+                phiOld[:, ngz:-ngz,ngy:-ngy,ngx:-ngx]
+                + dt*((   phiOld[:, ngz  :-ngz      , ngy  :-ngy      , ngx+1:hix-ngx+1]
+                        -2*phiOld[:, ngz  :-ngz      , ngy  :-ngy      , ngx  :-ngx      ]
+                          +phiOld[:, ngz  :-ngz      , ngy  :-ngy      , ngx-1:hix-ngx-1]) / dx[0]**2
+                      +(   phiOld[:, ngz  :-ngz      , ngy+1:hiy-ngy+1, ngx  :-ngx      ]
+                        -2*phiOld[:, ngz  :-ngz      , ngy  :-ngy      , ngx  :-ngx      ]
+                          +phiOld[:, ngz  :-ngz      , ngy-1:hiy-ngy-1, ngx  :-ngx      ]) / dx[1]**2
+                      +(   phiOld[:, ngz+1:hiz-ngz+1, ngy  :-ngy      , ngx  :-ngx      ]
+                        -2*phiOld[:, ngz  :-ngz      , ngy  :-ngy      , ngx  :-ngx      ]
+                          +phiOld[:, ngz-1:hiz-ngz-1, ngy  :-ngy      , ngx  :-ngx      ]) / dx[2]**2))
+
+        # Update time
+        time = time + dt
+
+        # Copy new solution into old solution
+        amr.copy_mfab(dst=phi_old, src=phi_new, srccomp=0, dstcomp=0, numcomp=1, nghost=0)
+
+        amr.Print(f'Advanced step {step}\n')
+
+        # ---------------------------------------------------------------------
+        # VISUALIZATION BLOCK
+        # ---------------------------------------------------------------------
+        if plot_int > 0 and step % plot_int == 0:
+            # 1. Standard AMReX Plotfile
+            pltfile = amr.concatenate("plt", step, 5)
+            varnames = amr.Vector_string(['phi'])
+            amr.write_single_level_plotfile(pltfile, phi_new, varnames, geom, time, step)
+
+            # 2. PNG Visualization (Slice at z = center)
+            # Create a buffer to hold the stitched slice
+            slice_data = np.zeros((n_cell, n_cell))
+            z_mid = n_cell // 2
+
+            # Iterate over boxes to fill the slice
+            for mfi in phi_new:
+                bx = mfi.validbox()
+                lo = bx.small_end
+                hi = bx.big_end
+
+                # Check if this box intersects the middle Z plane
+                if lo[2] <= z_mid <= hi[2]:
+                    # Get data array
+                    arr_gpu = xp.array(phi_new.array(mfi), copy=False)
+                    
+                    # Move to CPU numpy if it's on GPU
+                    if hasattr(arr_gpu, 'get'):
+                        arr_cpu = arr_gpu.get()
+                    else:
+                        arr_cpu = np.array(arr_gpu)
+
+                    # Calculate local index for z_mid
+                    # Note: arr_cpu includes ghost cells [ngz : -ngz]
+                    local_z = z_mid - lo[2]
+                    raw_z_index = local_z + ngz
+
+                    # Extract the valid 2D plane (removing ghosts from x and y)
+                    # Shape is (comp, z, y, x)
+                    data_slice = arr_cpu[0, raw_z_index, ngy:-ngy, ngx:-ngx]
+
+                    # Place into global buffer using global indices
+                    slice_data[lo[1]:hi[1]+1, lo[0]:hi[0]+1] = data_slice
+
+            # Plotting
+            plt.figure(figsize=(8, 6))
+            plt.imshow(slice_data, origin='lower', extent=[0, 1, 0, 1], cmap='inferno')
+            plt.colorbar(label='Temperature (phi)')
+            plt.title(f"Heat Diffusion at Step {step} (Z-Slice)")
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            
+            # Save PNG
+            filename = f"vis_step_{step:05d}.png"
+            plt.savefig(filename)
+            plt.close()
+            amr.Print(f"Saved visualization: {filename}")
+
+
+if __name__ == '__main__':
+    # Initialize AMReX
+    amr.initialize([])
+
+    # Simulation parameters
+    n_cell = 32
+    max_grid_size = 16
+    nsteps = 1000
+    plot_int = 100
+    dt = 1e-5
+
+    main(n_cell, max_grid_size, nsteps, plot_int, dt)
+
+    # Finalize AMReX
+    amr.finalize()
